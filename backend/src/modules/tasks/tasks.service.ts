@@ -1,0 +1,2899 @@
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+  InternalServerErrorException,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
+import { Task, TaskPriority, TaskType, Prisma } from '@prisma/client';
+import { PrismaService } from '../../prisma/prisma.service';
+import { CreateTaskDto } from './dto/create-task.dto';
+import { UpdateTaskDto } from './dto/update-task.dto';
+import { BulkCreateTasksDto } from './dto/bulk-create-tasks.dto';
+import { TasksByStatus, TasksByStatusParams } from './dto/task-by-status.dto';
+import { AccessControlService } from 'src/common/access-control.utils';
+import { StorageService } from '../storage/storage.service';
+import { sanitizeHtml, sanitizeText, sanitizeObject } from 'src/common/utils/sanitizer.util';
+import { RecurrenceService } from './recurrence.service';
+import { RecurrenceConfigDto } from './dto/recurrence-config.dto';
+
+@Injectable()
+export class TasksService {
+  private readonly logger = new Logger(TasksService.name);
+
+  constructor(
+    private prisma: PrismaService,
+    private accessControl: AccessControlService,
+    private storageService: StorageService,
+    private recurrenceService: RecurrenceService,
+  ) {}
+
+  /**
+   * Flattens explicit m2m assignees/reporters from { user: { id, email, ... } }
+   * to { id, email, ... } for API backward compatibility.
+   */
+
+  private flattenTaskRelations<T>(task: T): T {
+    const result = { ...(task as Record<string, unknown>) };
+    if (result.assignees && Array.isArray(result.assignees)) {
+      result.assignees = (result.assignees as Array<{ user?: unknown }>).map((a) => a.user ?? a);
+    }
+    if (result.reporters && Array.isArray(result.reporters)) {
+      result.reporters = (result.reporters as Array<{ user?: unknown }>).map((r) => r.user ?? r);
+    }
+    if (result.childTasks && Array.isArray(result.childTasks)) {
+      result.childTasks = (result.childTasks as unknown[]).map((child) =>
+        this.flattenTaskRelations(child),
+      );
+    }
+    return result as T;
+  }
+
+  private flattenTasksList<T>(tasks: T[]): T[] {
+    return tasks.map((task) => this.flattenTaskRelations(task));
+  }
+
+  // Helper to get enum values safely
+  private getTaskType(value?: string): TaskType {
+    if (!value) return TaskType.TASK;
+    // Map string values to enum explicitly
+    const typeMap: Record<string, TaskType> = {
+      TASK: TaskType.TASK,
+      STORY: TaskType.STORY,
+      BUG: TaskType.BUG,
+      EPIC: TaskType.EPIC,
+      SUBTASK: TaskType.SUBTASK,
+    };
+    return typeMap[value] || TaskType.TASK;
+  }
+
+  private getTaskPriority(value?: string): TaskPriority {
+    if (!value) return TaskPriority.MEDIUM;
+    // Map string values to enum explicitly
+    const priorityMap: Record<string, TaskPriority> = {
+      LOWEST: TaskPriority.LOWEST,
+      LOW: TaskPriority.LOW,
+      MEDIUM: TaskPriority.MEDIUM,
+      HIGH: TaskPriority.HIGH,
+      HIGHEST: TaskPriority.HIGHEST,
+    };
+    return priorityMap[value] || TaskPriority.MEDIUM;
+  }
+
+  /**
+   * Generates a unique task number by locking the project row to prevent race conditions.
+   * This MUST be called within an interactive transaction.
+   */
+  public async getNextTaskNumber(
+    tx: Prisma.TransactionClient,
+    projectId: string,
+  ): Promise<{ taskNumber: number; taskSlug: string }> {
+    // 1. Lock the project row for this creation request
+    const projects = await tx.$queryRaw<{ slug: string; task_prefix: string | null }[]>`
+      SELECT slug, task_prefix FROM projects WHERE id = ${projectId}::uuid FOR UPDATE
+    `;
+
+    if (!projects || projects.length === 0) {
+      throw new NotFoundException('Project not found');
+    }
+
+    const taskPrefix = projects[0].task_prefix || projects[0].slug;
+
+    // 2. Safely find the last task number now that we hold the lock
+    const lastTask = await tx.task.findFirst({
+      where: { projectId },
+      orderBy: { taskNumber: 'desc' },
+      select: { taskNumber: true },
+    });
+
+    const taskNumber = lastTask ? lastTask.taskNumber + 1 : 1;
+
+    return {
+      taskNumber,
+      taskSlug: `${taskPrefix}-${taskNumber}`,
+    };
+  }
+
+  async create(createTaskDto: CreateTaskDto, userId: string): Promise<Task> {
+    const project = await this.prisma.project.findUnique({
+      where: { id: createTaskDto.projectId },
+      select: {
+        slug: true,
+        id: true,
+        workspaceId: true,
+        workspace: {
+          select: {
+            organizationId: true,
+            organization: { select: { ownerId: true } },
+          },
+        },
+      },
+    });
+
+    if (!project) {
+      throw new NotFoundException('Project not found');
+    }
+
+    // Check if user can create tasks in this project
+    const projectAccess = await this.accessControl.getProjectAccess(
+      createTaskDto.projectId,
+      userId,
+    );
+
+    if (!projectAccess.canChange) {
+      throw new ForbiddenException('Insufficient permissions to create task in this project');
+    }
+
+    // Validate that startDate is before dueDate
+    if (createTaskDto.startDate && createTaskDto.dueDate) {
+      if (new Date(createTaskDto.startDate) > new Date(createTaskDto.dueDate)) {
+        throw new BadRequestException('Start date must be before the due date');
+      }
+    }
+
+    let sprintId = createTaskDto.sprintId;
+
+    if (!sprintId) {
+      const sprintResult = await this.prisma.sprint.findFirst({
+        where: { projectId: project.id, isDefault: true },
+      });
+      sprintId = sprintResult?.id;
+    }
+
+    return this.prisma.$transaction(async (tx) => {
+      const { taskNumber, taskSlug } = await this.getNextTaskNumber(tx, createTaskDto.projectId);
+      const { assigneeIds, reporterIds, description, isRecurring, recurrenceConfig, ...taskData } =
+        createTaskDto;
+
+      // Build task create data - filter out undefined values
+      const taskCreateData: any = {
+        description: description ? sanitizeHtml(description) : undefined,
+        createdBy: userId,
+        taskNumber,
+        slug: taskSlug,
+        sprintId: sprintId,
+        isRecurring: isRecurring || false,
+      };
+
+      // Add optional fields only if they have values
+      if (taskData.title) taskCreateData.title = sanitizeText(taskData.title);
+      if (taskData.type) taskCreateData.type = taskData.type;
+      if (taskData.priority) taskCreateData.priority = taskData.priority;
+      if (taskData.projectId) taskCreateData.projectId = taskData.projectId;
+      if (taskData.statusId) taskCreateData.statusId = taskData.statusId;
+      if (taskData.startDate) taskCreateData.startDate = taskData.startDate;
+      if (taskData.dueDate) taskCreateData.dueDate = taskData.dueDate;
+      if (taskData.storyPoints !== undefined) taskCreateData.storyPoints = taskData.storyPoints;
+      if (taskData.originalEstimate !== undefined)
+        taskCreateData.originalEstimate = taskData.originalEstimate;
+      if (taskData.remainingEstimate !== undefined)
+        taskCreateData.remainingEstimate = taskData.remainingEstimate;
+      if (taskData.customFields)
+        taskCreateData.customFields = sanitizeObject(taskData.customFields);
+      if (taskData.parentTaskId) taskCreateData.parentTaskId = taskData.parentTaskId;
+      if (taskData.completedAt !== undefined) taskCreateData.completedAt = taskData.completedAt;
+      if (taskData.allowEmailReplies !== undefined)
+        taskCreateData.allowEmailReplies = taskData.allowEmailReplies;
+
+      // Only add assignees if there are any
+      if (assigneeIds?.length) {
+        taskCreateData.assignees = {
+          create: assigneeIds.map((id) => ({ userId: id })),
+        };
+      }
+
+      // Only add reporters if there are any
+      if (reporterIds?.length) {
+        taskCreateData.reporters = {
+          create: reporterIds.map((id) => ({ userId: id })),
+        };
+      }
+
+      // Create the task
+      const task = await tx.task.create({
+        data: taskCreateData,
+        include: {
+          project: {
+            select: {
+              id: true,
+              name: true,
+              workspace: {
+                select: {
+                  id: true,
+                  name: true,
+                  slug: true,
+                  organization: {
+                    select: { id: true, name: true, slug: true },
+                  },
+                },
+              },
+            },
+          },
+          assignees: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  email: true,
+                  firstName: true,
+                  lastName: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+          reporters: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  email: true,
+                  firstName: true,
+                  lastName: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+          status: {
+            select: { id: true, name: true, color: true, category: true },
+          },
+          sprint: {
+            select: { id: true, name: true, status: true },
+          },
+          parentTask: {
+            select: { id: true, title: true, slug: true, type: true },
+          },
+          _count: {
+            select: {
+              childTasks: true,
+              comments: true,
+              attachments: true,
+              watchers: true,
+            },
+          },
+        },
+      });
+
+      // If this is a recurring task, create the recurrence configuration
+      if (isRecurring && recurrenceConfig) {
+        const nextOccurrence = this.recurrenceService.calculateNextOccurrence(
+          task.dueDate || new Date(),
+          recurrenceConfig,
+        );
+
+        await tx.recurringTask.create({
+          data: {
+            taskId: task.id,
+            recurrenceType: recurrenceConfig.recurrenceType,
+            interval: recurrenceConfig.interval,
+            daysOfWeek: recurrenceConfig.daysOfWeek || [],
+            dayOfMonth: recurrenceConfig.dayOfMonth,
+            monthOfYear: recurrenceConfig.monthOfYear,
+            endType: recurrenceConfig.endType,
+            endDate: recurrenceConfig.endDate ? new Date(recurrenceConfig.endDate) : null,
+            occurrenceCount: recurrenceConfig.occurrenceCount,
+            nextOccurrence,
+            isActive: true,
+          },
+        });
+      }
+
+      return task;
+    });
+  }
+
+  async bulkCreate(
+    dto: BulkCreateTasksDto,
+    userId: string,
+  ): Promise<{
+    created: number;
+    failed: number;
+    failures: Array<{
+      index: number;
+      title: string;
+      reason: string;
+    }>;
+  }> {
+    // Validate empty tasks array first
+    if (!dto.tasks || dto.tasks.length === 0) {
+      throw new BadRequestException('Tasks array cannot be empty');
+    }
+
+    // Verify status exists before checking project access
+    const status = await this.prisma.taskStatus.findUnique({
+      where: { id: dto.statusId },
+    });
+    if (!status) {
+      throw new BadRequestException('Invalid status ID');
+    }
+
+    const project = await this.prisma.project.findUnique({
+      where: { id: dto.projectId },
+      select: {
+        id: true,
+        slug: true,
+        workspaceId: true,
+        workspace: {
+          select: {
+            organizationId: true,
+            organization: { select: { ownerId: true } },
+          },
+        },
+      },
+    });
+
+    if (!project) {
+      throw new NotFoundException('Project not found');
+    }
+
+    const projectAccess = await this.accessControl.getProjectAccess(dto.projectId, userId);
+    if (!projectAccess.canChange) {
+      throw new ForbiddenException('Insufficient permissions to create tasks in this project');
+    }
+
+    let sprintId = dto.sprintId;
+    if (!sprintId) {
+      const defaultSprint = await this.prisma.sprint.findFirst({
+        where: { projectId: project.id, isDefault: true },
+      });
+      sprintId = defaultSprint?.id;
+    }
+
+    const tasks = dto.tasks;
+    const failures: Array<{ index: number; title: string; reason: string }> = [];
+    const validTasks: Array<{
+      title: string;
+      description?: string;
+      type: TaskType;
+      priority: TaskPriority;
+      dueDate?: Date;
+      projectId: string;
+      statusId: string;
+      createdBy: string;
+      updatedBy: string;
+      taskNumber: number;
+      slug: string;
+      sprintId?: string;
+      isRecurring: boolean;
+    }> = [];
+
+    // Validate each task before bulk insert
+    tasks.forEach((item, index) => {
+      // Validate title
+      if (!item.title || item.title.trim().length === 0) {
+        failures.push({
+          index,
+          title: item.title || '(empty)',
+          reason: 'Title is required',
+        });
+        return;
+      }
+
+      // Validate title length
+      if (item.title.length > 500) {
+        failures.push({
+          index,
+          title: item.title.substring(0, 50) + '...',
+          reason: 'Title exceeds maximum length of 500 characters',
+        });
+        return;
+      }
+
+      // Validate description length if provided
+      if (item.description && item.description.length > 5000) {
+        failures.push({
+          index,
+          title: item.title,
+          reason: 'Description exceeds maximum length of 5000 characters',
+        });
+        return;
+      }
+
+      // Validate dueDate format if provided
+      if (item.dueDate) {
+        const date = new Date(item.dueDate);
+        if (isNaN(date.getTime())) {
+          failures.push({
+            index,
+            title: item.title,
+            reason: 'Invalid due date format. Use YYYY-MM-DD',
+          });
+          return;
+        }
+      }
+
+      // Task is valid, add to validTasks with proper enum types
+      validTasks.push({
+        title: sanitizeText(item.title),
+        description: item.description ? sanitizeHtml(item.description) : undefined,
+        type: this.getTaskType(item.type),
+        priority: this.getTaskPriority(item.priority),
+        dueDate: item.dueDate ? new Date(item.dueDate) : undefined,
+        projectId: dto.projectId,
+        statusId: dto.statusId,
+        createdBy: userId,
+        updatedBy: userId,
+        taskNumber: 0, // Will be set below
+        slug: '', // Will be set below
+        sprintId,
+        isRecurring: false,
+      });
+    });
+
+    // If all tasks failed validation, return early
+    if (validTasks.length === 0 && failures.length > 0) {
+      return {
+        created: 0,
+        failed: failures.length,
+        failures,
+      };
+    }
+
+    return this.prisma.$transaction(
+      async (tx) => {
+        const projects = await tx.$queryRaw<{ slug: string; task_prefix: string | null }[]>`
+          SELECT slug, task_prefix FROM projects WHERE id = ${dto.projectId}::uuid FOR UPDATE
+        `;
+
+        if (!projects || projects.length === 0) {
+          throw new NotFoundException('Project not found');
+        }
+
+        const taskPrefix = projects[0].task_prefix || projects[0].slug;
+
+        const lastTask = await tx.task.findFirst({
+          where: { projectId: dto.projectId },
+          orderBy: { taskNumber: 'desc' },
+          select: { taskNumber: true },
+        });
+
+        let nextNumber = lastTask ? lastTask.taskNumber + 1 : 1;
+
+        // Assign task numbers and slugs to valid tasks
+        const taskRecords = validTasks.map((task) => {
+          const num = nextNumber++;
+          const slug = `${taskPrefix}-${num}`;
+
+          // Build task record without undefined values for createMany
+          return {
+            title: task.title,
+            type: task.type,
+            priority: task.priority,
+            projectId: task.projectId,
+            statusId: task.statusId,
+            createdBy: task.createdBy,
+            updatedBy: task.updatedBy,
+            taskNumber: num,
+            slug,
+            isRecurring: task.isRecurring,
+            ...(task.description !== undefined && { description: task.description }),
+            ...(task.dueDate !== undefined && { dueDate: task.dueDate }),
+            ...(task.sprintId !== undefined && { sprintId: task.sprintId }),
+          };
+        });
+
+        // If no valid tasks to create, return early
+        if (taskRecords.length === 0) {
+          return {
+            created: 0,
+            failed: failures.length,
+            failures,
+          };
+        }
+
+        // Use individual create calls instead of createMany to handle enums properly
+        const createdTasks = await Promise.all(
+          taskRecords.map((record) =>
+            tx.task.create({
+              data: record,
+            }),
+          ),
+        );
+
+        return {
+          created: createdTasks.length,
+          failed: failures.length,
+          failures,
+        };
+      },
+      {
+        timeout: 60000,
+      },
+    );
+  }
+  // Updated Task Create with Attachments
+  async createWithAttachments(
+    createTaskDto: CreateTaskDto,
+    userId: string,
+    files?: Express.Multer.File[],
+  ) {
+    const project = await this.prisma.project.findUnique({
+      where: { id: createTaskDto.projectId },
+      select: {
+        slug: true,
+        id: true,
+        workspaceId: true,
+        workspace: {
+          select: {
+            organizationId: true,
+            organization: { select: { ownerId: true } },
+          },
+        },
+      },
+    });
+
+    if (!project) {
+      throw new NotFoundException('Project not found');
+    }
+
+    // Permission checks
+    const projectAccess = await this.accessControl.getProjectAccess(
+      createTaskDto.projectId,
+      userId,
+    );
+
+    if (!projectAccess.canChange) {
+      throw new ForbiddenException('Insufficient permissions to create task in this project');
+    }
+
+    // Validate that startDate is before dueDate
+    if (createTaskDto.startDate && createTaskDto.dueDate) {
+      if (new Date(createTaskDto.startDate) > new Date(createTaskDto.dueDate)) {
+        throw new BadRequestException('Start date must be before the due date');
+      }
+    }
+
+    let sprintId = createTaskDto.sprintId;
+
+    if (!sprintId) {
+      const sprintResult = await this.prisma.sprint.findFirst({
+        where: { projectId: project.id, isDefault: true },
+      });
+      sprintId = sprintResult?.id;
+    }
+
+    const task = await this.prisma.$transaction(async (tx) => {
+      const { taskNumber, taskSlug } = await this.getNextTaskNumber(tx, createTaskDto.projectId);
+      const { assigneeIds, reporterIds, description, isRecurring, recurrenceConfig, ...taskData } =
+        createTaskDto;
+
+      // Build task create data - filter out undefined values
+      const taskCreateData: any = {
+        description: description ? sanitizeHtml(description) : undefined,
+        createdBy: userId,
+        taskNumber,
+        slug: taskSlug,
+        sprintId: sprintId,
+        isRecurring: isRecurring || false,
+      };
+
+      // Add optional fields only if they have values
+      if (taskData.title) taskCreateData.title = sanitizeText(taskData.title);
+      if (taskData.type) taskCreateData.type = taskData.type;
+      if (taskData.priority) taskCreateData.priority = taskData.priority;
+      if (taskData.projectId) taskCreateData.projectId = taskData.projectId;
+      if (taskData.statusId) taskCreateData.statusId = taskData.statusId;
+      if (taskData.startDate) taskCreateData.startDate = taskData.startDate;
+      if (taskData.dueDate) taskCreateData.dueDate = taskData.dueDate;
+      if (taskData.storyPoints !== undefined) taskCreateData.storyPoints = taskData.storyPoints;
+      if (taskData.originalEstimate !== undefined)
+        taskCreateData.originalEstimate = taskData.originalEstimate;
+      if (taskData.remainingEstimate !== undefined)
+        taskCreateData.remainingEstimate = taskData.remainingEstimate;
+      if (taskData.customFields)
+        taskCreateData.customFields = sanitizeObject(taskData.customFields);
+      if (taskData.parentTaskId) taskCreateData.parentTaskId = taskData.parentTaskId;
+      if (taskData.completedAt !== undefined) taskCreateData.completedAt = taskData.completedAt;
+      if (taskData.allowEmailReplies !== undefined)
+        taskCreateData.allowEmailReplies = taskData.allowEmailReplies;
+
+      // Only add assignees if there are any
+      if (assigneeIds?.length) {
+        taskCreateData.assignees = {
+          create: assigneeIds.map((id) => ({ userId: id })),
+        };
+      }
+
+      // Only add reporters if there are any
+      if (reporterIds?.length) {
+        taskCreateData.reporters = {
+          create: reporterIds.map((id) => ({ userId: id })),
+        };
+      }
+
+      // --- Create Task ---
+      const createdTask = await tx.task.create({
+        data: taskCreateData,
+      });
+
+      // If this is a recurring task, create the recurrence configuration
+      if (isRecurring && recurrenceConfig) {
+        const nextOccurrence = this.recurrenceService.calculateNextOccurrence(
+          createdTask.dueDate || new Date(),
+          recurrenceConfig,
+        );
+
+        await tx.recurringTask.create({
+          data: {
+            taskId: createdTask.id,
+            recurrenceType: recurrenceConfig.recurrenceType,
+            interval: recurrenceConfig.interval,
+            daysOfWeek: recurrenceConfig.daysOfWeek || [],
+            dayOfMonth: recurrenceConfig.dayOfMonth,
+            monthOfYear: recurrenceConfig.monthOfYear,
+            endType: recurrenceConfig.endType,
+            endDate: recurrenceConfig.endDate ? new Date(recurrenceConfig.endDate) : null,
+            occurrenceCount: recurrenceConfig.occurrenceCount,
+            nextOccurrence,
+            isActive: true,
+          },
+        });
+      }
+
+      // --- Handle Attachments ---
+      if (files && files.length > 0) {
+        const attachmentPromises = files.map(async (file) => {
+          const { url, key, size } = await this.storageService.saveFile(
+            file,
+            `tasks/${createdTask.id}`,
+          );
+
+          return tx.taskAttachment.create({
+            data: {
+              taskId: createdTask.id,
+              fileName: file.originalname,
+              fileSize: size,
+              mimeType: file.mimetype,
+              url: url, // Static/local or pre-signed path
+              storageKey: key,
+              createdBy: userId,
+            },
+          });
+        });
+
+        await Promise.all(attachmentPromises);
+      }
+
+      return createdTask;
+    });
+
+    // --- Return task with attachments + presigned URLs ---
+    return this.getTaskWithPresignedUrls(task.id);
+  }
+
+  // Helper method to fetch task and generate presigned URLs for attachments
+  private async getTaskWithPresignedUrls(taskId: string) {
+    const task = await this.prisma.task.findUnique({
+      where: { id: taskId },
+      include: {
+        project: {
+          select: {
+            id: true,
+            name: true,
+            workspace: {
+              select: {
+                id: true,
+                name: true,
+                slug: true,
+                organization: {
+                  select: { id: true, name: true, slug: true },
+                },
+              },
+            },
+          },
+        },
+        assignees: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        reporters: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        status: {
+          select: { id: true, name: true, color: true, category: true },
+        },
+        sprint: {
+          select: { id: true, name: true, status: true },
+        },
+        parentTask: {
+          select: { id: true, title: true, slug: true, type: true },
+        },
+        attachments: {
+          select: {
+            id: true,
+            fileName: true,
+            fileSize: true,
+            mimeType: true,
+            url: true,
+            storageKey: true,
+            createdAt: true,
+          },
+        },
+        _count: {
+          select: {
+            childTasks: true,
+            comments: true,
+            attachments: true,
+            watchers: true,
+          },
+        },
+      },
+    });
+
+    // Generate presigned URLs for attachments
+    if (task && task.attachments.length > 0) {
+      const attachmentsWithUrls = await Promise.all(
+        task.attachments.map(async (attachment) => {
+          // If URL is null (S3 case), generate presigned URL
+          // const _isCloud = attachment.url;
+          const viewUrl = attachment.url
+            ? attachment.url
+            : attachment?.storageKey &&
+              (await this.storageService.getFileUrl(attachment?.storageKey));
+
+          return {
+            ...attachment,
+            viewUrl, // Add presigned URL for viewing
+          };
+        }),
+      );
+
+      return this.flattenTaskRelations({
+        ...task,
+        attachments: attachmentsWithUrls,
+      });
+    }
+    return task ? this.flattenTaskRelations(task) : task;
+  }
+
+  async findAll(
+    organizationId: string,
+    projectId?: string[],
+    sprintId?: string,
+    workspaceId?: string[],
+    parentTaskId?: string,
+    priorities?: string[],
+    statuses?: string[],
+    types?: string[],
+    assigneeIds?: string[],
+    reporterIds?: string[],
+    userId?: string,
+    search?: string,
+    sortBy?: string,
+    sortOrder?: string,
+    page: number = 1,
+    limit: number = 20,
+  ): Promise<{
+    data: Task[];
+    total: number;
+    page: number;
+    limit: number;
+    totalPages: number;
+    filterCounts: {
+      priorities: { value: string; count: number }[];
+      types: { value: string; count: number }[];
+      statuses: { id: string; name: string; count: number }[];
+      assignees: { id: string; name: string; count: number }[];
+      reporters: { id: string; name: string; count: number }[];
+    };
+  }> {
+    if (!userId) {
+      throw new ForbiddenException('User context required');
+    }
+
+    const access = await this.accessControl.getOrgAccess(organizationId, userId);
+
+    // Verify organization exists
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    // Build base where clause
+    const whereClause: any = {
+      // Ensure tasks belong to the organization through project->workspace->organization
+      project: {
+        workspace: {
+          organizationId: organizationId,
+        },
+      },
+    };
+
+    // If not super admin and not organization elevated user (OWNER/MANAGER), apply visibility filters
+    if (!access.isSuperAdmin && !access.isElevated) {
+      whereClause.project.OR = this.accessControl.getProjectVisibilityFilter(userId);
+    }
+
+    // Add conditions using AND array to avoid conflicts
+    const andConditions: any[] = [];
+
+    // Filter by workspace if provided
+    if (workspaceId && workspaceId.length > 0) {
+      andConditions.push({
+        project: {
+          workspaceId: { in: workspaceId },
+        },
+      });
+    }
+
+    // Filter by project if provided
+    if (projectId && projectId.length > 0) {
+      andConditions.push({
+        projectId: { in: projectId },
+      });
+    }
+
+    // Filter by sprint if provided
+    if (sprintId) {
+      andConditions.push({
+        sprintId: sprintId,
+      });
+    }
+
+    // Handle parentTaskId filtering
+    if (parentTaskId !== undefined) {
+      if (parentTaskId === 'null' || parentTaskId === '' || parentTaskId === null) {
+        whereClause.parentTaskId = null;
+      } else {
+        whereClause.parentTaskId = parentTaskId;
+      }
+    }
+
+    // Filter by priorities if provided
+    if (priorities && priorities.length > 0) {
+      andConditions.push({
+        priority: { in: priorities },
+      });
+    }
+
+    // Filter by statuses if provided
+    if (statuses && statuses.length > 0) {
+      andConditions.push({
+        statusId: { in: statuses },
+      });
+    }
+
+    // Filter by types if provided
+    if (types && types.length > 0) {
+      andConditions.push({
+        type: { in: types },
+      });
+    }
+
+    if (assigneeIds && assigneeIds.length > 0) {
+      andConditions.push({
+        assignees: {
+          some: { userId: { in: assigneeIds } },
+        },
+      });
+    }
+    if (reporterIds && reporterIds.length > 0) {
+      andConditions.push({
+        reporters: {
+          some: { userId: { in: reporterIds } },
+        },
+      });
+    }
+    // Add search functionality
+    if (search && search.trim()) {
+      andConditions.push({
+        OR: [
+          { title: { contains: search.trim(), mode: 'insensitive' } },
+          { description: { contains: search.trim(), mode: 'insensitive' } },
+        ],
+      });
+    }
+
+    // User access restrictions for non-elevated users
+    // if (!isElevated) {
+    //   andConditions.push({
+    //     OR: [
+    //       { assignees: { some: { userId: userId } } },
+    //       { reporters: { some: { userId: userId } } },
+    //       { createdBy: userId },
+    //     ],
+    //   });
+    // }
+
+    // Add all conditions to the where clause
+    if (andConditions.length > 0) {
+      whereClause.AND = andConditions;
+    }
+
+    // Pagination calculation
+    const skip = (page - 1) * limit;
+
+    let orderBy: any = { taskNumber: 'desc' };
+    if (sortBy === 'dueIn' || sortBy === 'dueDate') {
+      orderBy = { dueDate: sortOrder === 'asc' ? 'asc' : 'desc' };
+    } else if (sortBy) {
+      const validSortFields = [
+        'createdAt',
+        'updatedAt',
+        'completedAt',
+        'priority',
+        'storyPoints',
+        'title',
+        'taskNumber',
+      ];
+      if (validSortFields.includes(sortBy)) {
+        orderBy = { [sortBy]: sortOrder === 'asc' ? 'asc' : 'desc' };
+      } else if (sortBy === 'status') {
+        orderBy = { status: { name: sortOrder === 'asc' ? 'asc' : 'desc' } };
+      } else if (sortBy === 'commentsCount') {
+        orderBy = { comments: { _count: sortOrder === 'asc' ? 'asc' : 'desc' } };
+      }
+    }
+    // Execute query and count in transaction
+    const [tasks, total] = await this.prisma.$transaction([
+      this.prisma.task.findMany({
+        where: whereClause,
+        include: {
+          labels: {
+            select: {
+              taskId: true,
+              labelId: true,
+              label: {
+                select: {
+                  id: true,
+                  name: true,
+                  color: true,
+                  description: true,
+                },
+              },
+            },
+          },
+          project: {
+            select: {
+              id: true,
+              name: true,
+              slug: true,
+              workspace: {
+                select: {
+                  id: true,
+                  name: true,
+                  slug: true,
+                  organizationId: true,
+                },
+              },
+              inbox: true,
+            },
+          },
+          assignees: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  email: true,
+                  firstName: true,
+                  lastName: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+          reporters: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  email: true,
+                  firstName: true,
+                  lastName: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+          status: {
+            select: { id: true, name: true, color: true, category: true },
+          },
+          sprint: { select: { id: true, name: true, slug: true, status: true } },
+          parentTask: {
+            select: { id: true, title: true, slug: true, type: true },
+          },
+          _count: {
+            select: { childTasks: true, comments: true, attachments: true },
+          },
+        },
+        orderBy,
+        skip,
+        take: limit,
+      }),
+      this.prisma.task.count({ where: whereClause }),
+    ]);
+
+    // Transform the response
+    const transformedTasks = tasks.map((task) => ({
+      ...task,
+      showEmailReply: task.project?.inbox?.enabled === true,
+      labels: task.labels.map((taskLabel) => ({
+        taskId: taskLabel.taskId,
+        labelId: taskLabel.labelId,
+        name: taskLabel.label.name,
+        color: taskLabel.label.color,
+        description: taskLabel.label.description,
+      })),
+    }));
+
+    // Compute filter facet counts using the same whereClause
+    const [priorityCounts, typeCounts, statusCounts, assigneeCounts, reporterCounts] =
+      await this.prisma.$transaction([
+        this.prisma.task.groupBy({
+          by: ['priority'],
+          where: whereClause,
+          _count: true,
+          orderBy: { priority: 'asc' },
+        }),
+        this.prisma.task.groupBy({
+          by: ['type'],
+          where: whereClause,
+          _count: true,
+          orderBy: { type: 'asc' },
+        }),
+        this.prisma.task.groupBy({
+          by: ['statusId'],
+          where: whereClause,
+          _count: true,
+          orderBy: { statusId: 'asc' },
+        }),
+        this.prisma.taskAssignee.groupBy({
+          by: ['userId'],
+          where: { task: whereClause },
+          _count: true,
+          orderBy: { userId: 'asc' },
+        }),
+        this.prisma.taskReporter.groupBy({
+          by: ['userId'],
+          where: { task: whereClause },
+          _count: true,
+          orderBy: { userId: 'asc' },
+        }),
+      ]);
+
+    // Fetch status names for display
+    const statusIds = statusCounts.map((s) => s.statusId);
+    const statusNames =
+      statusIds.length > 0
+        ? await this.prisma.taskStatus.findMany({
+            where: { id: { in: statusIds } },
+            select: { id: true, name: true },
+          })
+        : [];
+    const statusNameMap = new Map(statusNames.map((s) => [s.id, s.name]));
+
+    // Fetch assignee names for display
+    const assigneeUserIds = assigneeCounts.map((a) => a.userId);
+    const assigneeUsers =
+      assigneeUserIds.length > 0
+        ? await this.prisma.user.findMany({
+            where: { id: { in: assigneeUserIds } },
+            select: { id: true, firstName: true, lastName: true },
+          })
+        : [];
+    const assigneeNameMap = new Map(
+      assigneeUsers.map((u) => [u.id, `${u.firstName} ${u.lastName}`]),
+    );
+
+    // Fetch reporter names for display
+    const reporterUserIds = reporterCounts.map((r) => r.userId);
+    const reporterUsers =
+      reporterUserIds.length > 0
+        ? await this.prisma.user.findMany({
+            where: { id: { in: reporterUserIds } },
+            select: { id: true, firstName: true, lastName: true },
+          })
+        : [];
+    const reporterNameMap = new Map(
+      reporterUsers.map((u) => [u.id, `${u.firstName} ${u.lastName}`]),
+    );
+
+    const filterCounts = {
+      priorities: priorityCounts.map((p) => ({
+        value: p.priority,
+        count: p._count as unknown as number,
+      })),
+      types: typeCounts.map((t) => ({
+        value: t.type,
+        count: t._count as unknown as number,
+      })),
+      statuses: statusCounts.map((s) => ({
+        id: s.statusId,
+        name: statusNameMap.get(s.statusId) || '',
+        count: s._count as unknown as number,
+      })),
+      assignees: assigneeCounts.map((a) => ({
+        id: a.userId,
+        name: assigneeNameMap.get(a.userId) || '',
+        count: a._count as unknown as number,
+      })),
+      reporters: reporterCounts.map((r) => ({
+        id: r.userId,
+        name: reporterNameMap.get(r.userId) || '',
+        count: r._count as unknown as number,
+      })),
+    };
+
+    return {
+      data: this.flattenTasksList(transformedTasks),
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+      filterCounts,
+    };
+  }
+
+  async getTasks(
+    organizationId: string,
+    projectId?: string[],
+    sprintId?: string,
+    workspaceId?: string[],
+    parentTaskId?: string,
+    priorities?: string[],
+    statuses?: string[],
+    types?: string[],
+    userId?: string,
+    search?: string,
+    sortBy?: string,
+    sortOrder?: string,
+  ): Promise<Task[]> {
+    if (!userId) {
+      throw new ForbiddenException('User context required');
+    }
+
+    const access = await this.accessControl.getOrgAccess(organizationId, userId);
+
+    // Verify organization exists
+    const organization = await this.prisma.organization.findUnique({
+      where: { id: organizationId },
+      select: { id: true },
+    });
+
+    if (!organization) {
+      throw new NotFoundException('Organization not found');
+    }
+
+    // Build base where clause
+    const whereClause: any = {
+      project: {
+        workspace: { organizationId },
+      },
+    };
+
+    // If not super admin and not organization elevated user (OWNER/MANAGER), apply visibility filters
+    if (!access.isSuperAdmin && !access.isElevated) {
+      whereClause.project.OR = this.accessControl.getProjectVisibilityFilter(userId);
+    }
+
+    const andConditions: any[] = [];
+
+    if (workspaceId?.length) {
+      andConditions.push({ project: { workspaceId: { in: workspaceId } } });
+    }
+
+    if (projectId?.length) {
+      andConditions.push({ projectId: { in: projectId } });
+    }
+
+    if (sprintId) {
+      andConditions.push({ sprintId });
+    }
+
+    if (parentTaskId !== undefined) {
+      if (parentTaskId === 'all') {
+        // Do not filter by parentTaskId to include both main tasks and subtasks
+      } else {
+        whereClause.parentTaskId =
+          parentTaskId === 'null' || parentTaskId === '' ? null : parentTaskId;
+      }
+    } else {
+      // Default to showing only main tasks (not subtasks) for backward compatibility
+      whereClause.parentTaskId = null;
+    }
+
+    if (priorities?.length) {
+      andConditions.push({ priority: { in: priorities } });
+    }
+
+    if (statuses?.length) {
+      andConditions.push({ statusId: { in: statuses } });
+    }
+
+    if (types?.length) {
+      andConditions.push({ type: { in: types } });
+    }
+
+    if (search?.trim()) {
+      andConditions.push({
+        OR: [
+          { title: { contains: search.trim(), mode: 'insensitive' } },
+          { description: { contains: search.trim(), mode: 'insensitive' } },
+        ],
+      });
+    }
+
+    // Add all conditions to the where clause
+    if (andConditions.length > 0) {
+      whereClause.AND = andConditions;
+    }
+    let orderBy: any = { taskNumber: 'desc' };
+    if (sortBy === 'dueIn' || sortBy === 'dueDate') {
+      orderBy = { dueDate: sortOrder === 'asc' ? 'asc' : 'desc' };
+    } else if (sortBy) {
+      const validSortFields = [
+        'createdAt',
+        'updatedAt',
+        'completedAt',
+        'priority',
+        'storyPoints',
+        'title',
+        'taskNumber',
+      ];
+      if (validSortFields.includes(sortBy)) {
+        orderBy = { [sortBy]: sortOrder === 'asc' ? 'asc' : 'desc' };
+      } else if (sortBy === 'status') {
+        orderBy = { status: { name: sortOrder === 'asc' ? 'asc' : 'desc' } };
+      } else if (sortBy === 'commentsCount') {
+        orderBy = { comments: { _count: sortOrder === 'asc' ? 'asc' : 'desc' } };
+      }
+    }
+
+    const tasks = await this.prisma.task.findMany({
+      where: whereClause,
+      include: {
+        labels: {
+          select: {
+            taskId: true,
+            labelId: true,
+            label: {
+              select: { id: true, name: true, color: true, description: true },
+            },
+          },
+        },
+        project: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            workspace: {
+              select: { id: true, name: true, slug: true, organizationId: true },
+            },
+          },
+        },
+        assignees: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        reporters: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        status: {
+          select: { id: true, name: true, color: true, category: true },
+        },
+        sprint: { select: { id: true, name: true, slug: true, status: true } },
+        parentTask: {
+          select: { id: true, title: true, slug: true, type: true },
+        },
+        _count: {
+          select: { childTasks: true, comments: true, attachments: true },
+        },
+      },
+      orderBy,
+    });
+
+    return this.flattenTasksList(
+      tasks.map((task) => ({
+        ...task,
+        labels: task.labels.map((taskLabel) => ({
+          taskId: taskLabel.taskId,
+          labelId: taskLabel.labelId,
+          name: taskLabel.label.name,
+          color: taskLabel.label.color,
+          description: taskLabel.label.description,
+        })),
+      })),
+    );
+  }
+
+  async findOne(id: string, userId: string) {
+    const { isElevated } = await this.accessControl.getTaskAccess(id, userId);
+
+    const task = await this.prisma.task.findUnique({
+      where: { id },
+      include: {
+        project: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+            workspace: {
+              select: {
+                id: true,
+                name: true,
+                slug: true,
+                organization: {
+                  select: { id: true, name: true, slug: true },
+                },
+              },
+            },
+          },
+        },
+        assignees: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        reporters: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        status: {
+          select: { id: true, name: true, color: true, category: true },
+        },
+        sprint: {
+          select: {
+            id: true,
+            name: true,
+            status: true,
+            startDate: true,
+            endDate: true,
+          },
+        },
+        parentTask: {
+          select: { id: true, title: true, slug: true, type: true },
+        },
+        childTasks: isElevated
+          ? {
+              select: {
+                id: true,
+                title: true,
+                slug: true,
+                type: true,
+                priority: true,
+                status: {
+                  select: { name: true, color: true, category: true },
+                },
+                assignees: {
+                  select: {
+                    user: {
+                      select: {
+                        id: true,
+                        email: true,
+                        firstName: true,
+                        lastName: true,
+                        avatar: true,
+                      },
+                    },
+                  },
+                },
+                reporters: {
+                  select: {
+                    user: {
+                      select: {
+                        id: true,
+                        email: true,
+                        firstName: true,
+                        lastName: true,
+                        avatar: true,
+                      },
+                    },
+                  },
+                },
+              },
+            }
+          : {
+              select: {
+                id: true,
+                title: true,
+                slug: true,
+                type: true,
+                priority: true,
+                status: {
+                  select: { name: true, color: true, category: true },
+                },
+                assignees: {
+                  select: {
+                    user: {
+                      select: {
+                        id: true,
+                        email: true,
+                        firstName: true,
+                        lastName: true,
+                        avatar: true,
+                      },
+                    },
+                  },
+                },
+              },
+              where: {
+                OR: [
+                  { assignees: { some: { userId: userId } } },
+                  { reporters: { some: { userId: userId } } },
+                  { createdBy: userId },
+                ],
+              },
+            },
+        labels: {
+          include: {
+            label: {
+              select: { id: true, name: true, color: true, description: true },
+            },
+          },
+        },
+        watchers: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        comments: {
+          include: {
+            author: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+          orderBy: { createdAt: 'desc' },
+        },
+        attachments: {
+          select: {
+            id: true,
+            fileName: true,
+            fileSize: true,
+            mimeType: true,
+            createdAt: true,
+          },
+        },
+        timeEntries: {
+          include: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+          orderBy: { date: 'desc' },
+        },
+        createdByUser: {
+          select: {
+            firstName: true,
+            lastName: true,
+            id: true,
+          },
+        },
+        recurringConfig: {
+          select: {
+            id: true,
+            recurrenceType: true,
+            interval: true,
+            daysOfWeek: true,
+            dayOfMonth: true,
+            monthOfYear: true,
+            endType: true,
+            endDate: true,
+            occurrenceCount: true,
+            currentOccurrence: true,
+            nextOccurrence: true,
+            isActive: true,
+          },
+        },
+        _count: {
+          select: {
+            childTasks: true,
+            comments: true,
+            attachments: true,
+            watchers: true,
+            timeEntries: true,
+          },
+        },
+      },
+    });
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+    const projectInbox = await this.prisma.projectInbox.findUnique({
+      where: { projectId: task.projectId },
+    });
+    return this.flattenTaskRelations({
+      ...task,
+      showEmailReply: projectInbox,
+      labels: task.labels.map((taskLabel) => ({
+        taskId: taskLabel.taskId,
+        labelId: taskLabel.labelId,
+        name: taskLabel.label.name,
+        color: taskLabel.label.color,
+        description: taskLabel.label.description,
+      })),
+    });
+  }
+
+  async findByKey(key: string, userId: string) {
+    const task = await this.prisma.task.findFirst({
+      where: { slug: key },
+      select: { id: true },
+    });
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    // Check access
+    await this.accessControl.getTaskAccess(task.id, userId);
+
+    return this.findOne(task.id, userId);
+  }
+
+  async update(id: string, updateTaskDto: UpdateTaskDto, userId: string): Promise<Task> {
+    const { canChange, task: taskFromAccess } = await this.accessControl.getTaskAccess(id, userId);
+
+    if (!canChange) {
+      throw new ForbiddenException('Insufficient permissions to update this task');
+    }
+
+    const task = taskFromAccess;
+
+    const effectiveStartDate = updateTaskDto.startDate ?? task?.startDate?.toISOString();
+    const effectiveDueDate = updateTaskDto.dueDate ?? task?.dueDate?.toISOString();
+    if (effectiveStartDate && effectiveDueDate) {
+      if (new Date(effectiveStartDate) > new Date(effectiveDueDate)) {
+        throw new BadRequestException('Start date must be before the due date');
+      }
+    }
+
+    try {
+      let taskStatus;
+
+      if (updateTaskDto.statusId) {
+        taskStatus = await this.prisma.taskStatus.findUnique({
+          where: { id: updateTaskDto.statusId },
+        });
+
+        if (!taskStatus) {
+          throw new NotFoundException('Task status not found');
+        }
+      }
+
+      // Handle completedAt based on status
+      if (taskStatus?.category === 'DONE') {
+        updateTaskDto.completedAt = new Date().toISOString();
+      } else if (taskStatus) {
+        updateTaskDto.completedAt = null;
+      }
+      const { assigneeIds, reporterIds, description, title, customFields, ...taskData } =
+        updateTaskDto;
+      const updateData: any = { ...taskData };
+
+      // Sanitize description if provided
+      if (description !== undefined) {
+        updateData.description = sanitizeHtml(description);
+      }
+
+      // Sanitize title if provided
+      if (title !== undefined) {
+        updateData.title = sanitizeText(title);
+      }
+
+      // Sanitize customFields if provided
+      if (customFields !== undefined) {
+        updateData.customFields = sanitizeObject(customFields);
+      }
+
+      // Handle assignees update
+      if (assigneeIds !== undefined) {
+        if (assigneeIds.length > 0) {
+          const existingUsers = await this.prisma.user.findMany({
+            where: { id: { in: assigneeIds } },
+            select: { id: true },
+          });
+          const foundIds = new Set(existingUsers.map((u) => u.id));
+          const missingIds = assigneeIds.filter((id) => !foundIds.has(id));
+          if (missingIds.length > 0) {
+            throw new NotFoundException(`Users not found: ${missingIds.join(', ')}`);
+          }
+        }
+        updateData.assignees = {
+          deleteMany: {},
+          create: assigneeIds.map((id) => ({ userId: id })),
+        };
+      }
+
+      // Handle reporters update
+      if (reporterIds !== undefined) {
+        if (reporterIds.length > 0) {
+          const existingUsers = await this.prisma.user.findMany({
+            where: { id: { in: reporterIds } },
+            select: { id: true },
+          });
+          const foundIds = new Set(existingUsers.map((u) => u.id));
+          const missingIds = reporterIds.filter((id) => !foundIds.has(id));
+          if (missingIds.length > 0) {
+            throw new NotFoundException(`Users not found: ${missingIds.join(', ')}`);
+          }
+        }
+        updateData.reporters = {
+          deleteMany: {},
+          create: reporterIds.map((id) => ({ userId: id })),
+        };
+      }
+      const updatedTask = await this.prisma.task.update({
+        where: { id },
+        data: updateData,
+        include: {
+          project: {
+            select: { id: true, name: true, slug: true },
+          },
+          assignees: {
+            select: {
+              user: {
+                select: { id: true, firstName: true, lastName: true, avatar: true },
+              },
+            },
+          },
+          reporters: {
+            select: {
+              user: {
+                select: { id: true, firstName: true, lastName: true, avatar: true },
+              },
+            },
+          },
+          status: {
+            select: { id: true, name: true, color: true, category: true },
+          },
+          parentTask: {
+            select: { id: true, title: true, slug: true, type: true },
+          },
+          _count: {
+            select: { childTasks: true, comments: true },
+          },
+        },
+      });
+
+      return this.flattenTaskRelations(updatedTask);
+    } catch (error: any) {
+      this.logger.error('Failed to update the task');
+      if (error.code === 'P2025') {
+        throw new NotFoundException('Task not found');
+      }
+      throw error;
+    }
+  }
+
+  async remove(id: string, userId: string): Promise<void> {
+    const { isElevated } = await this.accessControl.getTaskAccess(id, userId);
+
+    if (!isElevated) {
+      throw new ForbiddenException('Only managers and owners can delete tasks');
+    }
+
+    try {
+      // Check if task exists and has subtasks
+      const taskWithCounts = await this.prisma.task.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          _count: {
+            select: { childTasks: true },
+          },
+        },
+      });
+
+      if (!taskWithCounts) {
+        throw new NotFoundException('Task not found');
+      }
+
+      await this.prisma.task.delete({
+        where: { id },
+      });
+    } catch (error: any) {
+      this.logger.error('Failed to delete the task');
+      if (error.code === 'P2025') {
+        throw new NotFoundException('Task not found');
+      }
+      throw error;
+    }
+  }
+
+  async addComment(taskId: string, comment: string, userId: string) {
+    // Check task access first and get task object
+    const { task } = await this.accessControl.getTaskAccess(taskId, userId);
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    const newComment = await this.prisma.taskComment.create({
+      data: {
+        content: sanitizeHtml(comment),
+        taskId: taskId,
+        authorId: userId,
+      },
+      include: {
+        author: {
+          select: { id: true, firstName: true, lastName: true, avatar: true },
+        },
+      },
+    });
+
+    return newComment;
+  }
+
+  async findByOrganization(
+    orgId: string,
+    assigneeId?: string,
+    priority?: TaskPriority,
+    search?: string,
+    page: number = 1,
+    limit: number = 10,
+    userId?: string,
+  ): Promise<{
+    tasks: Task[];
+    pagination: {
+      currentPage: number;
+      totalPages: number;
+      totalCount: number;
+      hasNextPage: boolean;
+      hasPrevPage: boolean;
+    };
+  }> {
+    if (!userId) {
+      throw new ForbiddenException('User context required');
+    }
+
+    const access = await this.accessControl.getOrgAccess(orgId, userId);
+
+    const workspaces = await this.prisma.workspace.findMany({
+      where: { organizationId: orgId },
+      select: { id: true },
+    });
+
+    const workspaceIds = workspaces.map((w) => w.id);
+    if (workspaceIds.length === 0) {
+      return {
+        tasks: [],
+        pagination: {
+          currentPage: page,
+          totalPages: 0,
+          totalCount: 0,
+          hasNextPage: false,
+          hasPrevPage: false,
+        },
+      };
+    }
+
+    const projects = await this.prisma.project.findMany({
+      where: { workspaceId: { in: workspaceIds } },
+      select: { id: true },
+    });
+
+    const projectIds = projects.map((p) => p.id);
+    if (projectIds.length === 0) {
+      return {
+        tasks: [],
+        pagination: {
+          currentPage: page,
+          totalPages: 0,
+          totalCount: 0,
+          hasNextPage: false,
+          hasPrevPage: false,
+        },
+      };
+    }
+
+    const whereClause: any = {
+      projectId: { in: projectIds },
+      parentTaskId: null,
+    };
+
+    if (priority) {
+      whereClause.priority = priority;
+    }
+
+    const andConditions: any[] = [];
+
+    if (search && search.trim()) {
+      andConditions.push({
+        OR: [
+          { title: { contains: search, mode: 'insensitive' } },
+          { description: { contains: search, mode: 'insensitive' } },
+        ],
+      });
+    }
+
+    // If not elevated (and not super admin), apply visibility filters
+    if (!access.isSuperAdmin && !access.isElevated) {
+      andConditions.push({
+        OR: [
+          ...this.accessControl.getTaskVisibilityFilter(userId),
+          { assignees: { some: { userId: userId } } },
+          { reporters: { some: { userId: userId } } },
+          { createdBy: userId },
+        ],
+      });
+    }
+
+    if (andConditions.length > 0) {
+      whereClause.AND = andConditions;
+    }
+
+    const totalCount = await this.prisma.task.count({
+      where: whereClause,
+    });
+
+    const totalPages = Math.ceil(totalCount / limit);
+    const skip = (page - 1) * limit;
+
+    const tasks = await this.prisma.task.findMany({
+      where: whereClause,
+      include: {
+        labels: { include: { label: true } },
+        project: { select: { id: true, name: true, slug: true } },
+        assignees: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+                email: true,
+              },
+            },
+          },
+        },
+        reporters: {
+          select: {
+            user: {
+              select: { id: true, firstName: true, lastName: true, avatar: true },
+            },
+          },
+        },
+        status: {
+          select: { id: true, name: true, color: true, category: true },
+        },
+        sprint: { select: { id: true, name: true, slug: true, status: true } },
+        parentTask: {
+          select: { id: true, title: true, slug: true, type: true },
+        },
+        _count: { select: { childTasks: true, comments: true } },
+      },
+      orderBy: { taskNumber: 'desc' },
+      skip,
+      take: limit,
+    });
+
+    const transformedTasks = tasks.map((task) => ({
+      ...task,
+      labels: task.labels.map((taskLabel) => ({
+        taskId: taskLabel.taskId,
+        labelId: taskLabel.labelId,
+        name: taskLabel.label.name,
+        color: taskLabel.label.color,
+        description: taskLabel.label.description,
+      })),
+    }));
+
+    return {
+      tasks: this.flattenTasksList(transformedTasks),
+      pagination: {
+        currentPage: page,
+        totalPages,
+        totalCount,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
+      },
+    };
+  }
+
+  async findTodaysTasks(
+    organizationId: string,
+    filters: {
+      assigneeId?: string;
+      reporterId?: string;
+      userId?: string;
+    } = {},
+    page: number = 1,
+    limit: number = 10,
+    userId?: string,
+  ): Promise<{
+    tasks: Task[];
+    pagination: {
+      currentPage: number;
+      totalPages: number;
+      totalCount: number;
+      hasNextPage: boolean;
+      hasPrevPage: boolean;
+    };
+  }> {
+    if (!userId) {
+      throw new ForbiddenException('User context required');
+    }
+
+    const access = await this.accessControl.getOrgAccess(organizationId, userId);
+
+    const today = new Date();
+    const startOfDay = new Date(today);
+    startOfDay.setHours(0, 0, 0, 0);
+
+    const endOfDay = new Date(today);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const workspaces = await this.prisma.workspace.findMany({
+      where: { organizationId },
+      select: { id: true },
+    });
+
+    const workspaceIds = workspaces.map((w) => w.id);
+    if (workspaceIds.length === 0) {
+      return {
+        tasks: [],
+        pagination: {
+          currentPage: page,
+          totalPages: 0,
+          totalCount: 0,
+          hasNextPage: false,
+          hasPrevPage: false,
+        },
+      };
+    }
+
+    const projects = await this.prisma.project.findMany({
+      where: { workspaceId: { in: workspaceIds } },
+      select: { id: true },
+    });
+
+    const projectIds = projects.map((p) => p.id);
+    if (projectIds.length === 0) {
+      return {
+        tasks: [],
+        pagination: {
+          currentPage: page,
+          totalPages: 0,
+          totalCount: 0,
+          hasNextPage: false,
+          hasPrevPage: false,
+        },
+      };
+    }
+
+    const whereClause: Prisma.TaskWhereInput = {
+      projectId: { in: projectIds },
+      OR: [
+        { dueDate: { gte: startOfDay, lte: endOfDay } },
+        { createdAt: { gte: startOfDay, lte: endOfDay } },
+        { updatedAt: { gte: startOfDay, lte: endOfDay } },
+        { completedAt: { gte: startOfDay, lte: endOfDay } },
+      ],
+    };
+
+    const userFilters: Prisma.TaskWhereInput[] = [];
+
+    if (filters.assigneeId) {
+      userFilters.push({ assignees: { some: { userId: filters.assigneeId } } });
+    }
+
+    if (filters.reporterId) {
+      userFilters.push({ reporters: { some: { userId: filters.reporterId } } });
+    }
+
+    if (filters.userId) {
+      userFilters.push(
+        { assignees: { some: { userId: filters.userId } } },
+        { reporters: { some: { userId: filters.userId } } },
+        { createdBy: filters.userId },
+      );
+    }
+
+    // If not elevated (and not super admin), apply visibility and user filtering
+    if (!access.isSuperAdmin && !access.isElevated) {
+      const visibilityAndUserFilters: Prisma.TaskWhereInput[] = [
+        ...this.accessControl.getTaskVisibilityFilter(userId),
+        ...(userFilters.length > 0
+          ? userFilters
+          : [
+              { assignees: { some: { userId: userId } } },
+              { reporters: { some: { userId: userId } } },
+              { createdBy: userId },
+            ]),
+      ];
+      whereClause.AND = [{ OR: whereClause.OR }, { OR: visibilityAndUserFilters }];
+      delete whereClause.OR;
+    } else if (userFilters.length > 0) {
+      // Elevated users only get filtered if they provided specific filter params
+      whereClause.AND = [{ OR: whereClause.OR }, { OR: userFilters }];
+      delete whereClause.OR;
+    }
+
+    const [totalCount, tasks] = await Promise.all([
+      this.prisma.task.count({ where: whereClause }),
+      this.prisma.task.findMany({
+        where: whereClause,
+        include: {
+          project: {
+            select: {
+              id: true,
+              name: true,
+              workspace: {
+                select: { id: true, name: true, organizationId: true },
+              },
+            },
+          },
+          assignees: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  avatar: true,
+                  email: true,
+                },
+              },
+            },
+          },
+          reporters: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  firstName: true,
+                  lastName: true,
+                  avatar: true,
+                  email: true,
+                },
+              },
+            },
+          },
+          status: {
+            select: { id: true, name: true, color: true, category: true },
+          },
+          sprint: {
+            select: { id: true, name: true, status: true },
+          },
+          parentTask: {
+            select: { id: true, title: true, type: true },
+          },
+          _count: {
+            select: { childTasks: true, comments: true, timeEntries: true },
+          },
+        },
+        orderBy: [{ dueDate: 'asc' }, { updatedAt: 'desc' }],
+        skip: (page - 1) * limit,
+        take: limit,
+      }),
+    ]);
+
+    const totalPages = Math.ceil(totalCount / limit);
+
+    return {
+      tasks: this.flattenTasksList(tasks),
+      pagination: {
+        currentPage: page,
+        totalPages,
+        totalCount,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
+      },
+    };
+  }
+
+  async getTasksGroupedByStatus(
+    params: TasksByStatusParams,
+    userId: string,
+  ): Promise<TasksByStatus[]> {
+    if (!userId) {
+      throw new ForbiddenException('User context required');
+    }
+
+    const { slug, includeSubtasks = false, statusId, sprintId, page = 1, limit = 25 } = params;
+
+    try {
+      // Fetch project with workflow and statuses
+      const project = await this.prisma.project.findUnique({
+        where: { slug },
+        include: {
+          workflow: {
+            include: {
+              statuses: {
+                orderBy: { position: 'asc' },
+              },
+            },
+          },
+        },
+      });
+
+      if (!project || !project.workflow) {
+        throw new NotFoundException('Project or project workflow not found');
+      }
+
+      // Check project access
+      const projectAccess = await this.accessControl.getProjectAccess(project.id, userId);
+
+      // Build where clause
+      const whereClause: any = {
+        projectId: project.id,
+      };
+      if (sprintId) {
+        whereClause.sprintId = sprintId;
+      }
+
+      // Filter by user if not elevated
+      if (!projectAccess.isElevated) {
+        whereClause.OR = [
+          {
+            assignees: {
+              some: { userId: userId },
+            },
+          },
+          {
+            reporters: {
+              some: { userId: userId },
+            },
+          },
+          {
+            createdBy: userId,
+          },
+        ];
+      }
+
+      // Exclude subtasks if specified
+      if (!includeSubtasks) {
+        whereClause.parentTaskId = null;
+      }
+
+      // Filter workflow statuses based on statusId parameter
+      let workflowStatuses = project.workflow.statuses;
+      if (statusId) {
+        workflowStatuses = workflowStatuses.filter((status) => status.id === statusId);
+
+        if (workflowStatuses.length === 0) {
+          throw new NotFoundException(`Status with ID ${statusId} not found in project workflow`);
+        }
+      }
+
+      // Only get tasks from workflow statuses
+      whereClause.status = {
+        id: {
+          in: workflowStatuses.map((status) => status.id),
+        },
+      };
+
+      // Normalize pagination values
+      const currentPage = Math.max(1, page);
+      const pageLimit = Math.min(100, Math.max(1, limit));
+      const skip = (currentPage - 1) * pageLimit;
+
+      // Get counts for each status
+      const taskCountsByStatus = await Promise.all(
+        workflowStatuses.map(async (status) => {
+          const count = await this.prisma.task.count({
+            where: {
+              ...whereClause,
+              statusId: status.id,
+            },
+          });
+          return { statusId: status.id, count };
+        }),
+      );
+
+      const countMap = new Map(taskCountsByStatus.map((item) => [item.statusId, item.count]));
+
+      // Fetch paginated tasks for each status in parallel
+      const statusTasksPromises = workflowStatuses.map(async (status) => {
+        const totalCount = countMap.get(status.id) || 0;
+        const totalPages = Math.ceil(totalCount / pageLimit);
+
+        const tasks = await this.prisma.task.findMany({
+          where: {
+            ...whereClause,
+            statusId: status.id,
+            sprintId,
+          },
+          include: {
+            status: {
+              select: {
+                id: true,
+                name: true,
+                color: true,
+                category: true,
+                position: true,
+              },
+            },
+            assignees: {
+              select: {
+                user: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                    avatar: true,
+                  },
+                },
+              },
+            },
+            reporters: {
+              select: {
+                user: {
+                  select: {
+                    id: true,
+                    firstName: true,
+                    lastName: true,
+                  },
+                },
+              },
+            },
+          },
+          orderBy: [{ taskNumber: 'desc' }],
+          skip: skip,
+          take: pageLimit,
+        });
+
+        return {
+          statusId: status.id,
+          statusName: status.name,
+          statusColor: status.color,
+          statusCategory: status.category,
+          tasks: tasks.map((task) => ({
+            id: task.id,
+            title: task.title,
+            description: task.description || undefined,
+            priority: task.priority,
+            taskNumber: task.taskNumber,
+            assignees: task.assignees
+              ? task.assignees.map((assignee) => ({
+                  id: assignee.user.id,
+                  firstName: assignee.user.firstName,
+                  lastName: assignee.user.lastName,
+                  avatar: assignee.user.avatar || undefined,
+                }))
+              : undefined,
+            reporters: task.reporters
+              ? task.reporters.map((reporter) => ({
+                  id: reporter.user.id,
+                  firstName: reporter.user.firstName,
+                  lastName: reporter.user.lastName,
+                }))
+              : undefined,
+            dueDate: task.dueDate ? task.dueDate.toISOString() : undefined,
+            createdAt: task.createdAt.toISOString(),
+            updatedAt: task.updatedAt.toISOString(),
+          })),
+          pagination: {
+            total: totalCount,
+            page: currentPage,
+            limit: pageLimit,
+            totalPages: totalPages,
+            hasNextPage: currentPage < totalPages,
+            hasPreviousPage: currentPage > 1,
+          },
+        };
+      });
+
+      const results = await Promise.all(statusTasksPromises);
+
+      return results;
+    } catch (error) {
+      this.logger.error('Error fetching tasks grouped by status:');
+      if (error instanceof NotFoundException || error instanceof ForbiddenException) {
+        throw error;
+      }
+      throw new InternalServerErrorException('Failed to fetch tasks grouped by status');
+    }
+  }
+
+  // Additional helper methods with role-based filtering
+  async findSubtasksByParent(parentTaskId: string, userId: string): Promise<Task[]> {
+    const { isElevated } = await this.accessControl.getTaskAccess(parentTaskId, userId);
+
+    const whereClause: any = {
+      parentTaskId: parentTaskId,
+    };
+
+    // If not elevated, filter to user-related subtasks only
+    if (!isElevated) {
+      whereClause.OR = [{ assigneeId: userId }, { reporterId: userId }, { createdBy: userId }];
+    }
+
+    const subtasks = await this.prisma.task.findMany({
+      where: whereClause,
+      include: {
+        labels: { include: { label: true } },
+        project: {
+          select: { id: true, name: true, slug: true },
+        },
+        assignees: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+                email: true,
+              },
+            },
+          },
+        },
+        reporters: {
+          select: {
+            user: {
+              select: { id: true, firstName: true, lastName: true, avatar: true },
+            },
+          },
+        },
+        status: {
+          select: { id: true, name: true, color: true, category: true },
+        },
+        parentTask: {
+          select: { id: true, title: true, slug: true, type: true },
+        },
+        _count: {
+          select: { childTasks: true, comments: true },
+        },
+      },
+      orderBy: { taskNumber: 'asc' },
+    });
+    return this.flattenTasksList(subtasks);
+  }
+
+  async findMainTasks(
+    projectId?: string,
+    workspaceId?: string,
+    priorities?: string[],
+    statuses?: string[],
+    userId?: string,
+  ): Promise<Task[]> {
+    if (!userId) {
+      throw new ForbiddenException('User context required');
+    }
+
+    const whereClause: any = {
+      parentTaskId: null,
+    };
+
+    // Handle workspace filtering
+    if (workspaceId) {
+      const workspace = await this.prisma.workspace.findUnique({
+        where: { id: workspaceId },
+        select: { id: true, name: true, organizationId: true },
+      });
+
+      if (!workspace) {
+        throw new NotFoundException('Workspace not found');
+      }
+
+      // Check workspace access
+      const access = await this.accessControl.getWorkspaceAccess(workspaceId, userId);
+
+      whereClause.project = {
+        workspaceId,
+      };
+
+      // If not super admin and not workspace elevated user, apply visibility filters within workspace
+      if (!access.isSuperAdmin && !access.isElevated) {
+        whereClause.project.OR = this.accessControl.getProjectVisibilityFilter(userId);
+      }
+    } else if (projectId) {
+      await this.accessControl.getProjectAccess(projectId, userId);
+      whereClause.projectId = projectId;
+    } else {
+      // If neither workspaceId nor projectId is provided, we still need to ensure
+      // the user only sees what they have access to.
+      // This is less common for findMainTasks but should be handled.
+      throw new BadRequestException('Either projectId or workspaceId must be provided');
+    }
+
+    // Add priority filter
+    if (priorities && priorities.length > 0) {
+      whereClause.priority = { in: priorities };
+    }
+
+    // Add status filter
+    if (statuses && statuses.length > 0) {
+      whereClause.statusId = { in: statuses };
+    }
+
+    const tasks = await this.prisma.task.findMany({
+      where: whereClause,
+      include: {
+        labels: { include: { label: true } },
+        project: {
+          select: { id: true, name: true, slug: true },
+        },
+        assignees: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+                email: true,
+              },
+            },
+          },
+        },
+        reporters: {
+          select: {
+            user: {
+              select: { id: true, firstName: true, lastName: true, avatar: true },
+            },
+          },
+        },
+        status: {
+          select: { id: true, name: true, color: true, category: true },
+        },
+        _count: {
+          select: { childTasks: true, comments: true },
+        },
+      },
+      orderBy: { taskNumber: 'desc' },
+    });
+
+    return this.flattenTasksList(
+      tasks.map((task) => ({
+        ...task,
+        labels: task.labels.map((taskLabel) => ({
+          taskId: taskLabel.taskId,
+          labelId: taskLabel.labelId,
+          name: taskLabel.label.name,
+          color: taskLabel.label.color,
+          description: taskLabel.label.description,
+        })),
+      })),
+    );
+  }
+
+  async bulkDeleteTasks(params: {
+    taskIds?: string[];
+    projectId?: string;
+    all?: boolean;
+    excludedIds?: string[];
+    userId: string;
+  }): Promise<{
+    deletedCount: number;
+    failedTasks: Array<{ id: string; reason: string }>;
+  }> {
+    const { taskIds, projectId, all, excludedIds, userId } = params;
+
+    if ((!taskIds || taskIds.length === 0) && !all) {
+      throw new BadRequestException('No task IDs provided and "all" flag not set');
+    }
+
+    // Get user details
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { role: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+    const isSuperAdmin = user.role === 'SUPER_ADMIN';
+
+    // Build task filter
+    const taskFilter: any = {};
+    if (all) {
+      if (projectId) taskFilter.projectId = projectId;
+      if (excludedIds && excludedIds.length > 0) {
+        taskFilter.id = { notIn: excludedIds };
+      }
+    } else {
+      let finalTaskIds = taskIds || [];
+      if (excludedIds && excludedIds.length > 0) {
+        finalTaskIds = finalTaskIds.filter((id) => !excludedIds.includes(id));
+      }
+      taskFilter.id = { in: finalTaskIds };
+    }
+
+    // Fetch tasks with project and member info
+    const tasks = await this.prisma.task.findMany({
+      where: taskFilter,
+      include: {
+        project: {
+          include: {
+            members: {
+              where: { userId },
+              select: { role: true },
+            },
+          },
+        },
+      },
+    });
+
+    const deletableTasks: string[] = [];
+    const failedTasks: Array<{ id: string; reason: string }> = [];
+
+    for (const task of tasks) {
+      let canDelete = false;
+      if (isSuperAdmin) canDelete = true;
+      else if (task.createdBy === userId) canDelete = true;
+      else if (task.project.members.length > 0) {
+        const memberRole = task.project.members[0].role;
+        if (memberRole === 'OWNER' || memberRole === 'MANAGER') canDelete = true;
+      }
+
+      if (canDelete) deletableTasks.push(task.id);
+      else
+        failedTasks.push({
+          id: task.id,
+          reason: 'Insufficient permissions to delete this task',
+        });
+    }
+
+    // Handle missing tasks when using specific IDs
+    if (taskIds && taskIds.length > 0) {
+      const foundTaskIds = tasks.map((t) => t.id);
+      const missingTaskIds = taskIds.filter((id) => !foundTaskIds.includes(id));
+      missingTaskIds.forEach((id) => failedTasks.push({ id, reason: 'Task not found' }));
+    }
+
+    // Delete tasks directly (cascade will handle related records)
+    let deletedCount = 0;
+    if (deletableTasks.length > 0) {
+      try {
+        const result = await this.prisma.task.deleteMany({
+          where: { id: { in: deletableTasks } },
+        });
+        deletedCount = result.count;
+      } catch (error) {
+        this.logger.error('Failed to bulk delete tasks');
+        throw new InternalServerErrorException('Failed to delete tasks: ' + error.message);
+      }
+    }
+
+    return { deletedCount, failedTasks };
+  }
+
+  /**
+   * Complete current occurrence and generate the next one for recurring tasks
+   */
+  async completeOccurrenceAndGenerateNext(taskId: string, userId: string) {
+    // Verify task access
+    await this.accessControl.getTaskAccess(taskId, userId);
+
+    const task = await this.prisma.task.findUnique({
+      where: { id: taskId },
+      include: {
+        recurringConfig: true,
+        assignees: { select: { userId: true } },
+        reporters: { select: { userId: true } },
+      },
+    });
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    if (!task.isRecurring || !task.recurringConfig) {
+      throw new BadRequestException('This task is not a recurring task');
+    }
+
+    const recurringConfig = task.recurringConfig;
+
+    // Check if recurrence is complete
+    if (this.recurrenceService.isRecurrenceComplete(recurringConfig)) {
+      // Just mark this task as complete without generating next
+      const completedTask = await this.update(
+        taskId,
+        { completedAt: new Date().toISOString() },
+        userId,
+      );
+      return {
+        completedTask,
+        nextTask: null,
+      };
+    }
+
+    // Mark current task as complete
+    const completedTask = await this.update(
+      taskId,
+      { completedAt: new Date().toISOString() },
+      userId,
+    );
+
+    // Calculate next occurrence
+    const nextOccurrence = this.recurrenceService.calculateNextOccurrence(
+      task.dueDate || new Date(),
+      recurringConfig,
+    );
+
+    // Create next task instance
+    const nextTask = await this.create(
+      {
+        title: task.title,
+        description: task.description || undefined,
+        type: task.type,
+        priority: task.priority,
+        projectId: task.projectId,
+        statusId: task.statusId,
+        sprintId: task.sprintId || undefined,
+        dueDate: nextOccurrence.toISOString(),
+        assigneeIds: task.assignees.map((a) => a.userId),
+        reporterIds: task.reporters.map((r) => r.userId),
+        isRecurring: false, // Next instance is not itself recurring
+      },
+      userId,
+    );
+
+    // Update recurring config
+    await this.prisma.recurringTask.update({
+      where: { id: recurringConfig.id },
+      data: {
+        currentOccurrence: recurringConfig.currentOccurrence + 1,
+        nextOccurrence,
+      },
+    });
+
+    return {
+      completedTask,
+      nextTask,
+    };
+  }
+
+  /**
+   * Add recurrence configuration to an existing non-recurring task
+   */
+  async addRecurrence(taskId: string, recurrenceConfig: RecurrenceConfigDto, userId: string) {
+    await this.accessControl.getTaskAccess(taskId, userId);
+
+    const task = await this.prisma.task.findUnique({
+      where: { id: taskId },
+      include: { recurringConfig: true },
+    });
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    if (task.isRecurring || task.recurringConfig) {
+      throw new BadRequestException('This task is already a recurring task');
+    }
+
+    const nextOccurrence = this.recurrenceService.calculateNextOccurrence(
+      task.dueDate || new Date(),
+      recurrenceConfig,
+    );
+
+    // Create recurring task configuration
+    const recurringTask = await this.prisma.recurringTask.create({
+      data: {
+        taskId: taskId,
+        recurrenceType: recurrenceConfig.recurrenceType,
+        interval: recurrenceConfig.interval,
+        daysOfWeek: recurrenceConfig.daysOfWeek || [],
+        dayOfMonth: recurrenceConfig.dayOfMonth,
+        monthOfYear: recurrenceConfig.monthOfYear,
+        endType: recurrenceConfig.endType,
+        endDate: recurrenceConfig.endDate ? new Date(recurrenceConfig.endDate) : null,
+        occurrenceCount: recurrenceConfig.occurrenceCount,
+        nextOccurrence,
+        currentOccurrence: 1,
+        isActive: true,
+      },
+    });
+
+    // Update task to mark it as recurring
+    await this.prisma.task.update({
+      where: { id: taskId },
+      data: { isRecurring: true },
+    });
+
+    return recurringTask;
+  }
+
+  /**
+   * Update recurrence configuration for a task
+   */
+  async updateRecurrenceConfig(
+    taskId: string,
+    recurrenceConfig: RecurrenceConfigDto,
+    userId: string,
+  ) {
+    await this.accessControl.getTaskAccess(taskId, userId);
+
+    const task = await this.prisma.task.findUnique({
+      where: { id: taskId },
+      include: { recurringConfig: true },
+    });
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    if (!task.isRecurring || !task.recurringConfig) {
+      throw new BadRequestException('This task is not a recurring task');
+    }
+
+    const nextOccurrence = this.recurrenceService.calculateNextOccurrence(
+      task.dueDate || new Date(),
+      recurrenceConfig,
+    );
+
+    return this.prisma.recurringTask.update({
+      where: { id: task.recurringConfig.id },
+      data: {
+        recurrenceType: recurrenceConfig.recurrenceType,
+        interval: recurrenceConfig.interval,
+        daysOfWeek: recurrenceConfig.daysOfWeek || [],
+        dayOfMonth: recurrenceConfig.dayOfMonth,
+        monthOfYear: recurrenceConfig.monthOfYear,
+        endType: recurrenceConfig.endType,
+        endDate: recurrenceConfig.endDate ? new Date(recurrenceConfig.endDate) : null,
+        occurrenceCount: recurrenceConfig.occurrenceCount,
+        nextOccurrence,
+      },
+    });
+  }
+
+  /**
+   * Stop recurrence for a task
+   */
+  async stopRecurrence(taskId: string, userId: string) {
+    await this.accessControl.getTaskAccess(taskId, userId);
+
+    const task = await this.prisma.task.findUnique({
+      where: { id: taskId },
+      include: { recurringConfig: true },
+    });
+
+    if (!task) {
+      throw new NotFoundException('Task not found');
+    }
+
+    if (!task.isRecurring || !task.recurringConfig) {
+      throw new BadRequestException('This task is not a recurring task');
+    }
+
+    // Deactivate recurrence
+    await this.prisma.recurringTask.delete({
+      where: { id: task.recurringConfig.id },
+    });
+
+    // Update task to mark it as not recurring
+    return this.prisma.task.update({
+      where: { id: taskId },
+      data: { isRecurring: false },
+    });
+  }
+
+  /**
+   * Get all recurring tasks for a project
+   */
+  async getRecurringTasks(projectId: string, userId: string) {
+    // Verify project access
+    const project = await this.prisma.project.findUnique({
+      where: { id: projectId },
+      select: {
+        workspace: {
+          select: { organizationId: true },
+        },
+      },
+    });
+
+    if (!project) {
+      throw new NotFoundException('Project not found');
+    }
+
+    await this.accessControl.getOrgAccess(project.workspace.organizationId, userId);
+
+    const recurringTasks = await this.prisma.task.findMany({
+      where: {
+        projectId,
+        isRecurring: true,
+      },
+      include: {
+        recurringConfig: true,
+        assignees: {
+          select: {
+            user: {
+              select: {
+                id: true,
+                email: true,
+                firstName: true,
+                lastName: true,
+                avatar: true,
+              },
+            },
+          },
+        },
+        status: {
+          select: { id: true, name: true, color: true, category: true },
+        },
+      },
+    });
+    return this.flattenTasksList(recurringTasks);
+  }
+}

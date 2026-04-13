@@ -1,0 +1,86 @@
+{
+  "analytics_title": "Workspace Analytics",
+  "analytics_description": "Insights into your workspace performance and metrics",
+  "dashboard_settings": "Dashboard Settings",
+  "customize_widgets": "Customize your dashboard widgets",
+  "no_widgets_title": "No widgets to display",
+  "no_widgets_description": "All widgets are currently hidden. Use the customize button to show widgets.",
+  "show_all_widgets": "Show All Widgets",
+  "no_data": "No analytics data available for this organization.",
+  "load_data": "Load Data",
+  "error_loading": "Error loading organization analytics:",
+  "widgets": {
+    "kpi_metrics": "KPI Metrics",
+    "project_status": "Project Status Distribution",
+    "task_priority": "Task Priority Breakdown",
+    "task_type": "Task Type Distribution",
+    "sprint_status": "Sprint Status Overview",
+    "monthly_completion": "Monthly Task Completion",
+    "team_utilization": "Team Role Distribution",
+    "quality_metrics": "Bug Resolution Quality",
+    "workspace_projects": "Projects per Workspace",
+    "member_workload": "Member Workload Distribution",
+    "resource_allocation": "Resource Allocation"
+  },
+  "charts": {
+    "project_status_description": "Current status breakdown of all projects",
+    "task_priority_description": "Overview of tasks by their priority levels",
+    "task_type_description": "Distribution of tasks by their type",
+    "sprint_status_description": "Current status of all sprints in this workspace",
+    "kpi_metrics_description": "Key performance indicators for your workspace",
+    "monthly_completion_description": "Number of tasks completed each month"
+  },
+  "kpi": {
+    "total_projects": "Total Projects",
+    "active_projects": "Active Projects",
+    "completion_rate": "Completion Rate",
+    "total_tasks": "Total Tasks",
+    "overdue_tasks": "Overdue Tasks",
+    "task_health": "Task Health",
+    "excellent": "Excellent",
+    "good": "Good",
+    "needs_focus": "Needs Focus",
+    "perfect": "Perfect",
+    "critical": "Critical",
+    "monitor": "Monitor"
+  },
+  "header": {
+    "ready_to_tackle": "Ready to tackle your goals?",
+    "todays_agenda": "Today's Agenda",
+    "new_task": "New Task"
+  },
+  "analytics": {
+    "failed_to_fetch_today_task_data": "Failed to fetch today task data",
+    "error_loading_organization_analytics": "Error loading organization analytics:",
+    "today_agenda_tooltip": "Today Agenda",
+    "dashboard_settings_tooltip": "Dashboard Settings",
+    "dashboard_title": "Dashboard",
+    "dashboard_description": "Comprehensive insights into your organization's performance and health",
+    "no_analytics_data": "No analytics data available for this organization.",
+    "load_data_button": "Load Data",
+    "no_widgets_title": "No widgets to display",
+    "no_widgets_description": "All widgets are currently hidden. Use the customize button to show widgets.",
+    "show_all_widgets_button": "Show All Widgets",
+    "failed_to_load_widget_data": "Failed to load data for {{widgetTitle}}",
+    "retry_button": "Retry",
+    "kpi_cards": {
+      "workspaces": "Total Workspaces",
+      "projects": "Total Projects",
+      "members": "Team Members",
+      "task_completion": "Task Completion",
+      "bug_resolution": "Bug Resolution",
+      "overdue_tasks": "Overdue Tasks",
+      "active_sprints": "Active Sprints",
+      "productivity": "Overall Productivity",
+      "descriptions": {
+        "active_status": "{{count}} active",
+        "organization_members": "Organization members",
+        "tasks_count": "{{completed}} / {{total}} tasks",
+        "resolved_count": "{{resolved}} / {{total}} resolved",
+        "require_attention": "Require attention",
+        "currently_running": "Currently running",
+        "task_completion_rate": "Task completion rate"
+      }
+    }
+  }
+}
