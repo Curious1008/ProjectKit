@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Build distribution script for Taskosaur platform
+ * Build distribution script for ProjectKit platform
  * Cross-platform implementation of build:dist command
  */
 
@@ -51,7 +51,7 @@ function copyRecursive(src, dest) {
   }
 }
 
-console.log('\n🏗️  Building distribution for Taskosaur platform...\n');
+console.log('\n🏗️  Building distribution for ProjectKit platform...\n');
 
 // Step 1: Clean dist directory
 console.log('🧹 Cleaning dist directory...');

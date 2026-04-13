@@ -1,10 +1,10 @@
-# AGENTS.md - Taskosaur AI Agent Configuration
+# AGENTS.md - ProjectKit AI Agent Configuration
 
-This document provides guidance for AI agents working with the Taskosaur project, including development setup, testing, and code quality standards.
+This document provides guidance for AI agents working with the ProjectKit project, including development setup, testing, and code quality standards.
 
 ## Project Overview
 
-Taskosaur is an open-source project management platform with conversational AI task execution. It's built as a monorepo with:
+ProjectKit is an open-source project management platform with conversational AI task execution. It's built as a monorepo with:
 - **Backend**: NestJS API server (port 3000)
 - **Frontend**: Next.js application (port 3001)
 - **Database**: PostgreSQL with Prisma ORM
@@ -92,7 +92,7 @@ npm run clean:backend    # Clean backend build artifacts
 ## Project Structure
 
 ```
-taskosaur/
+projectkit/
 ├── backend/                # NestJS Backend (Port 3000)
 │   ├── src/
 │   │   ├── modules/       # Feature modules (auth, tasks, projects, etc.)
@@ -176,7 +176,7 @@ Key environment variables to configure:
 
 ```env
 # Database Configuration
-DATABASE_URL="postgresql://taskosaur:taskosaur@localhost:5432/taskosaur"
+DATABASE_URL="postgresql://projectkit:projectkit@localhost:5432/projectkit"
 
 # Authentication & Security
 JWT_SECRET="your-jwt-secret-key-change-this"
@@ -251,7 +251,7 @@ docs: update API documentation for task endpoints
 
 ## Agent Workflow
 
-When working on Taskosaur as an AI agent:
+When working on ProjectKit as an AI agent:
 
 1. **Always run linting after making changes**:
    ```bash
@@ -308,7 +308,7 @@ When working on Taskosaur as an AI agent:
 
 ## Support
 
-- GitHub Issues: https://github.com/Taskosaur/Taskosaur/issues
-- GitHub Discussions: https://github.com/Taskosaur/Taskosaur/discussions
+- GitHub Issues: https://github.com/Curious1008/ProjectKit/issues
+- GitHub Discussions: https://github.com/Curious1008/ProjectKit/discussions
 - Discord: https://discord.gg/5cpHUSxePp
-- Email: support@taskosaur.com
+- Email: support@projectkit.com

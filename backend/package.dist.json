@@ -1,10 +1,10 @@
 {
-  "name": "@taskosaur/dist",
+  "name": "@projectkit/dist",
   "version": "0.1.0",
-  "description": "Taskosaur Backend - NestJS API Server",
-  "author": "Taskosaur Team",
+  "description": "ProjectKit Backend - NestJS API Server",
+  "author": "ProjectKit Team",
   "private": true,
-  "license": "SEE LICENSE IN https://github.com/Taskosaur/Taskosaur/blob/main/LICENSE.md",
+  "license": "SEE LICENSE IN https://github.com/Curious1008/ProjectKit/blob/main/LICENSE.md",
   "main": "main.js",
   "scripts": {
     "start": "node main.js",

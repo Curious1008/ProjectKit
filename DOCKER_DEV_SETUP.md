@@ -1,6 +1,6 @@
 # Docker Development Setup
 
-Quick guide to run Taskosaur in development mode using Docker Compose.
+Quick guide to run ProjectKit in development mode using Docker Compose.
 
 ## Prerequisites
 

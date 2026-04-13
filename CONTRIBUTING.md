@@ -1,6 +1,6 @@
-# Contributing to Taskosaur
+# Contributing to ProjectKit
 
-Thank you for your interest in contributing to Taskosaur! We welcome contributions from the community and are grateful for your help in making this project better.
+Thank you for your interest in contributing to ProjectKit! We welcome contributions from the community and are grateful for your help in making this project better.
 
 ## Table of Contents
 
@@ -23,8 +23,8 @@ This project and everyone participating in it is governed by our [Code of Conduc
 1. **Fork the repository** on GitHub
 2. **Clone your fork** locally:
    ```bash
-   git clone https://github.com/Taskosaur/taskosaur.git
-   cd taskosaur
+   git clone https://github.com/ProjectKit/projectkit.git
+   cd projectkit
    ```
 3. **Follow the setup instructions** in the [README.md](README.md)
 4. **Create a branch** for your changes:
@@ -47,7 +47,7 @@ This project and everyone participating in it is governed by our [Code of Conduc
 - Consider the scope and impact
 
 ### Code Contributions
-- Check existing [issues](https://github.com/Taskosaur/taskosaur/issues) for good first issues
+- Check existing [issues](https://github.com/ProjectKit/projectkit/issues) for good first issues
 - Look for issues labeled `good first issue` or `help wanted`
 - Comment on issues you'd like to work on
 - Follow our coding standards and commit guidelines
@@ -230,9 +230,9 @@ Add screenshots here
 
 ## Community
 
-- **Discussions**: [GitHub Discussions](https://github.com/Taskosaur/taskosaur/discussions)
-- **Issues**: [GitHub Issues](https://github.com/Taskosaur/taskosaur/issues)
-- **Email**: support@taskosaur.com
+- **Discussions**: [GitHub Discussions](https://github.com/ProjectKit/projectkit/discussions)
+- **Issues**: [GitHub Issues](https://github.com/ProjectKit/projectkit/issues)
+- **Email**: support@projectkit.com
 
 ## Labels
 
@@ -253,8 +253,8 @@ Check our [Development Roadmap](README.md#development-roadmap) to see what we're
 ## Questions?
 
 If you have questions about contributing, feel free to:
-- Open a [Discussion](https://github.com/Taskosaur/taskosaur/discussions)
+- Open a [Discussion](https://github.com/ProjectKit/projectkit/discussions)
 - Create an issue with the `question` label
 - Reach out via email
 
-Thank you for contributing to Taskosaur!
+Thank you for contributing to ProjectKit!

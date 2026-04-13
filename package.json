@@ -1,10 +1,10 @@
 {
-    "name": "@taskosaur/platform",
+    "name": "@projectkit/platform",
     "version": "0.1.0",
-    "description": "Taskosaur Platform - Open Source Project Management with Conversational AI Task Execution",
-    "author": "Taskosaur Team",
+    "description": "ProjectKit Platform - Open Source Project Management with Conversational AI Task Execution",
+    "author": "ProjectKit Team",
     "private": true,
-    "license": "SEE LICENSE IN https://github.com/Taskosaur/Taskosaur/blob/main/LICENSE.md",
+    "license": "SEE LICENSE IN https://github.com/Curious1008/ProjectKit/blob/main/LICENSE.md",
     "workspaces": [
         "frontend",
         "backend"
@@ -55,10 +55,10 @@
         "clean": "npm run clean --workspaces --if-present && shx rm -rf node_modules dist out .next",
         "clean:frontend": "npm run clean --workspace=frontend",
         "clean:backend": "npm run clean --workspace=backend",
-        "docker:build:dev": "docker build -f Dockerfile.dev --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t taskosaur:dev .",
-        "docker:build:prod": "docker build -f Dockerfile.prod --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t taskosaur:latest .",
-        "docker:push:dev": "docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.prod --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t taskosaur/taskosaur:dev -t taskosaur/taskosaur:$(node -p \"require('./package.json').version\")-dev -t taskosaur/taskosaur:$(node -p \"require('./package.json').version\")-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) --push .",
-        "docker:push:stable": "docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.prod --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t taskosaur/taskosaur:latest -t taskosaur/taskosaur:$(node -p \"require('./package.json').version\") -t taskosaur/taskosaur:$(node -p \"require('./package.json').version\")-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) --push .",
+        "docker:build:dev": "docker build -f Dockerfile.dev --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t projectkit:dev .",
+        "docker:build:prod": "docker build -f Dockerfile.prod --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t projectkit:latest .",
+        "docker:push:dev": "docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.prod --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t projectkit/projectkit:dev -t projectkit/projectkit:$(node -p \"require('./package.json').version\")-dev -t projectkit/projectkit:$(node -p \"require('./package.json').version\")-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) --push .",
+        "docker:push:stable": "docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.prod --build-arg BUILD_NUMBER=$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) -t projectkit/projectkit:latest -t projectkit/projectkit:$(node -p \"require('./package.json').version\") -t projectkit/projectkit:$(node -p \"require('./package.json').version\")-$(git rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S) --push .",
         "generate:logo:icons": "node scripts/generate-logo-icons.js",
         "postinstall": "node scripts/postinstall.js",
         "prepare": "husky"

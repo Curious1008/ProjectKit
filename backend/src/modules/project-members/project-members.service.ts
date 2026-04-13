@@ -571,7 +571,7 @@ export class ProjectMembersService {
             where: {
               userId_organizationId: {
                 userId: requestUserId,
-                organizationId: (member.project.workspace as any).organizationId,
+                organizationId: member.project.workspace.organizationId,
               },
             },
           }),

@@ -486,7 +486,7 @@ export default function Sidebar() {
                         {activeItem ? activeItem.icon : "TS"}
                       </div>
                       <span className="layout-sidebar-header-dashboard-title">
-                        {activeItem ? activeItem.name : "Taskosaur"}
+                        {activeItem ? activeItem.name : "ProjectKit"}
                       </span>
                     </div>
                   </div>

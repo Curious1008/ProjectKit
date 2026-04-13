@@ -148,7 +148,7 @@ const CONFIG_SCHEMA = {
       {
         key: "sso_issuer_url",
         label: "Issuer URL",
-        description: "OIDC discovery URL, e.g., https://auth.example.com/application/o/taskosaur/",
+        description: "OIDC discovery URL, e.g., https://auth.example.com/application/o/projectkit/",
         type: "text" as const,
         defaultValue: "",
         category: "sso",

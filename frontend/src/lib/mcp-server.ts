@@ -6,8 +6,8 @@ interface ChatMessage {
   content: string;
 }
 
-// MCP Server configuration for Taskosaur context
-export interface TaskosaurContext {
+// MCP Server configuration for ProjectKit context
+export interface ProjectKitContext {
   currentWorkspace?: string;
   currentProject?: string;
   currentUser?: {
@@ -22,17 +22,17 @@ export interface MCPTool {
   name: string;
   description: string;
   parameters?: any;
-  execute: (params: any, context: TaskosaurContext) => Promise<any>;
+  execute: (params: any, context: ProjectKitContext) => Promise<any>;
 }
 
 class MCPServer {
-  private context: TaskosaurContext = {};
+  private context: ProjectKitContext = {};
   private tools: Map<string, MCPTool> = new Map();
   private conversationHistory: ChatMessage[] = [];
   private sessionId: string = this.getOrCreateSessionId();
 
   // Initialize MCP server with context
-  initialize(context: TaskosaurContext = {}) {
+  initialize(context: ProjectKitContext = {}) {
     this.context = context;
     this.conversationHistory = [];
     // Don't regenerate session ID on initialize - keep the persistent one
@@ -74,7 +74,7 @@ class MCPServer {
   }
 
   // Update context (e.g., when user navigates to different workspace/project)
-  updateContext(updates: Partial<TaskosaurContext>) {
+  updateContext(updates: Partial<ProjectKitContext>) {
     this.context = { ...this.context, ...updates };
   }
 
@@ -198,8 +198,8 @@ class MCPServer {
 export const mcpServer = new MCPServer();
 
 // Helper function to extract workspace and project from URL
-export function extractContextFromPath(pathname: string): Partial<TaskosaurContext> {
-  const context: Partial<TaskosaurContext> = {};
+export function extractContextFromPath(pathname: string): Partial<ProjectKitContext> {
+  const context: Partial<ProjectKitContext> = {};
   if (pathname == null || pathname == undefined) return context;
   const pathParts = pathname.split("/").filter(Boolean);
 

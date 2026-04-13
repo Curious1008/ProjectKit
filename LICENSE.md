@@ -23,7 +23,7 @@ In addition, Products that are not provided on a paid basis are not competitive.
 
 Hosting or using the Licensed Work(s) for internal purposes within an organization is not considered a competitive offering. NetTantra Technologies (India) Private Limited considers your organization to include all of your affiliates under common control. 
 
-For binding interpretive guidance on using Taskosaur under the Business Source License, please contact licensing@nettantra.com.
+For binding interpretive guidance on using ProjectKit under the Business Source License, please contact licensing@nettantra.com.
 
 ## Terms
 The Licensor hereby grants you the right to copy, modify, create derivative works, redistribute, and make non-production use of the Licensed Work. The Licensor may make an Additional Use Grant, above, permitting limited production use.

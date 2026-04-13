@@ -151,8 +151,8 @@ export function RegisterForm() {
         <div className="signup-mobile-logo">
           <div className="signup-mobile-logo-icon">
             <Image
-              src="/taskosaur-logo.svg"
-              alt="Taskosaur Logo"
+              src="/projectkit-logo.svg"
+              alt="ProjectKit Logo"
               width={50}
               height={50}
               className={`size-10 ${
@@ -163,7 +163,7 @@ export function RegisterForm() {
         </div>
 
         <h1 className="signup-form-title">Create Account</h1>
-        <p className="signup-form-subtitle">Join thousands of teams using Taskosaur</p>
+        <p className="signup-form-subtitle">Join thousands of teams using ProjectKit</p>
       </div>
 
       {/* Error Alert */}

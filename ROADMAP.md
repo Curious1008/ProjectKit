@@ -1,4 +1,4 @@
-# 🚀 Taskosaur Development Roadmap 
+# 🚀 ProjectKit Development Roadmap 
 
 ## ✅ Recently Completed Features
 - Interactive Gantt Chart with drag-and-drop and dependency visualization
@@ -47,4 +47,4 @@
 
 **Document Version:** 1.0  
 **Last Updated:** February 20, 2026  
-**Maintained By:** Taskosaur Development Team
+**Maintained By:** ProjectKit Development Team

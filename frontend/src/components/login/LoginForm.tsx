@@ -115,8 +115,8 @@ export function LoginForm() {
         <div className="signup-mobile-logo">
           <div className="signup-mobile-logo-icon">
             <Image
-              src="/taskosaur-logo.svg"
-              alt="Taskosaur Logo"
+              src="/projectkit-logo.svg"
+              alt="ProjectKit Logo"
               width={50}
               height={50}
               className={`size-10 ${
@@ -131,7 +131,7 @@ export function LoginForm() {
             {/* Show as flex row on max-md, block on md+ */}
             <div className="md:hidden">
               Welcome back to
-              <span className="flex items-center justify-center ">Taskosaur </span>
+              <span className="flex items-center justify-center ">ProjectKit </span>
             </div>
 
             {/* Block for md+ */}
@@ -321,7 +321,7 @@ export function LoginForm() {
               <div className="login-divider-border" />
             </div>
             <div className="login-divider-text-container">
-              <span className="login-divider-text">New to Taskosaur?</span>
+              <span className="login-divider-text">New to ProjectKit?</span>
             </div>
           </motion.div>
 

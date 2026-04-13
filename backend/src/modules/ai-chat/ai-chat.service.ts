@@ -44,7 +44,7 @@ export class AiChatService {
   }
 
   private generateSystemPrompt(): string {
-    return `You are Taskosaur AI assistant for browser automation.Your job is to help users automate tasks on web pages.
+    return `You are ProjectKit AI assistant for browser automation.Your job is to help users automate tasks on web pages.
 
 You will receive:
 1. The current page URL
@@ -65,8 +65,8 @@ OR
 ASK: [question] (only when required data missing)
 
 RESPONSE RULES:
-- For greetings (hi, hello, hey): DONE: Hi! How can I help you with Taskosaur today?
-- For off-topic/non-app requests: DONE: I can only help with Taskosaur tasks like creating tasks, projects, filtering, etc.
+- For greetings (hi, hello, hey): DONE: Hi! How can I help you with ProjectKit today?
+- For off-topic/non-app requests: DONE: I can only help with ProjectKit tasks like creating tasks, projects, filtering, etc.
 - For completed actions: DONE: [what was done, e.g. "Task created" or "Filter applied"]
 - For questions needing data: ASK: [specific question]
 - Keep responses short and clear - no explanations or thinking
@@ -267,7 +267,7 @@ FILTER RULES (VERY IMPORTANT - for filtering tasks by priority, status, type, et
         case 'openrouter':
           requestUrl = `${apiUrl}/chat/completions`;
           requestHeaders['HTTP-Referer'] = process.env.APP_URL || 'http://localhost:3000';
-          requestHeaders['X-Title'] = 'Taskosaur AI Assistant';
+          requestHeaders['X-Title'] = 'ProjectKit AI Assistant';
           requestBody.top_p = 0.9;
           requestBody.frequency_penalty = 0;
           requestBody.presence_penalty = 0;
@@ -490,7 +490,7 @@ Respond ONLY with the description text, nothing else.`;
         case 'openrouter':
           requestUrl = `${apiUrl}/chat/completions`;
           requestHeaders['HTTP-Referer'] = process.env.APP_URL || 'http://localhost:3000';
-          requestHeaders['X-Title'] = 'Taskosaur AI Assistant';
+          requestHeaders['X-Title'] = 'ProjectKit AI Assistant';
           break;
         case 'openai':
           requestUrl = `${apiUrl}/chat/completions`;
@@ -710,7 +710,7 @@ Respond ONLY with the description text, nothing else.`;
         case 'openrouter':
           requestUrl = `${validatedUrl}/chat/completions`;
           requestHeaders['HTTP-Referer'] = process.env.APP_URL || 'http://localhost:3000';
-          requestHeaders['X-Title'] = 'Taskosaur AI Assistant';
+          requestHeaders['X-Title'] = 'ProjectKit AI Assistant';
           break;
 
         case 'openai':

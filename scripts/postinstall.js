@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * Post-install script for Taskosaur platform
+ * Post-install script for ProjectKit platform
  * Sets up Husky git hooks after installation
  */
 
@@ -37,7 +37,7 @@ function isCI() {
   );
 }
 
-console.log('\n📦 Running postinstall for Taskosaur platform...\n');
+console.log('\n📦 Running postinstall for ProjectKit platform...\n');
 
 // Skip husky setup in CI environments or if .git doesn't exist
 const gitDir = path.join(__dirname, '..', '.git');

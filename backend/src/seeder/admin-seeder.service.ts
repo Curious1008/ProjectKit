@@ -18,7 +18,7 @@ export class AdminSeederService {
     const hashedPassword = await bcrypt.hash('password123', 10);
 
     const adminUserData = {
-      email: 'admin@taskosaur.com',
+      email: 'admin@projectkit.com',
       username: 'admin',
       firstName: 'Admin',
       lastName: 'User',

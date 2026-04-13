@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-echo "🚀 Starting Taskosaur Production Environment..."
+echo "🚀 Starting ProjectKit Production Environment..."
 
 # Function to wait for PostgreSQL
 wait_for_postgres() {
